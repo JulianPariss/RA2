@@ -5,163 +5,251 @@ using UnityEngine.InputSystem;
 
 namespace TumbalatasAR
 {
-    /// <summary>
-    /// Componente especializado en la captura de gestos táctiles de swipe / flick,
-    /// cálculo de inercia y proyección balística 3D continua de proyectiles hacia las latas.
-    /// Compatible con pantalla táctil móvil (Touchscreen) y ratón en Editor / XR Simulator.
-    /// Cumple con la regla de Cátedra: Collision Detection = Continuous Dynamic en proyectiles.
-    /// </summary>
     public class LanzadorProyectiles : MonoBehaviour
     {
-        [Header("Referencias AR")]
+        public static LanzadorProyectiles Instance { get; private set; }
+
+        [Header("Referencias")]
         [SerializeField] private Camera arCamera;
+        [SerializeField] private VistaLanzadorUI vistaUI;
 
-        [Header("Ajustes de Lanzamiento Táctil")]
-        [Tooltip("Distancia mínima en píxeles para reconocer un gesto de swipe")]
-        [SerializeField] private float distanciaMinimaSwipe = 50f;
-
-        [Tooltip("Multiplicador de fuerza según la velocidad del swipe")]
-        [SerializeField] private float factorFuerzaLanzamiento = 0.015f;
-
-        [Tooltip("Fuerza mínima de impulso del proyectil")]
-        [SerializeField] private float fuerzaMinima = 5.0f;
-
-        [Tooltip("Fuerza máxima de impulso del proyectil")]
-        [SerializeField] private float fuerzaMaxima = 22.0f;
-
-        [Tooltip("Tiempo de vida del proyectil antes de ser destruido (segundos)")]
+        [Header("Ajustes de Lanzamiento y Balística")]
+        [SerializeField] private float distanciaMinimaSwipe = 60f;
+        [SerializeField] private float tiempoCargaCompleta = 1.15f;
+        [SerializeField] private float fuerzaMinima = 6.0f;
+        [SerializeField] private float fuerzaMaxima = 26.0f;
         [SerializeField] private float tiempoVidaProyectil = 6.0f;
 
+        private bool m_CargandoLanzamiento;
+        private float m_CargaFuerzaNormalizada;
+        private float m_TiempoPresionado;
         private Vector2 m_SwipeInicioPos;
-        private float m_SwipeInicioTiempo;
-        private bool m_SwipeEnProgreso;
 
         private void Awake()
         {
+            if (Instance == null)
+            {
+                Instance = this;
+            }
+            else if (Instance != this)
+            {
+                Destroy(this);
+                return;
+            }
+
             if (arCamera == null)
             {
                 arCamera = Camera.main;
             }
+
+            if (vistaUI == null)
+            {
+                vistaUI = GetComponent<VistaLanzadorUI>();
+                if (vistaUI == null)
+                {
+                    vistaUI = gameObject.AddComponent<VistaLanzadorUI>();
+                }
+            }
+        }
+
+        private void Start()
+        {
+            ActualizarVisibilidadUIDisparo(false);
+            ActualizarVisualTipoMunicion();
         }
 
         private void Update()
         {
-            // Solo procesamos el lanzamiento cuando el juego se encuentra en fase activa
-            if (ControladorAR.Instance != null && ControladorAR.Instance.EstadoActual == EstadoJuego.Jugando)
+            bool enJuego = ControladorAR.Instance != null && ControladorAR.Instance.EstadoActual == EstadoJuego.Jugando;
+
+            ActualizarVisibilidadUIDisparo(enJuego);
+
+            if (enJuego)
             {
-                ProcesarEntradaParaLanzamiento();
+                ProcesarCargaYLanzamiento();
             }
-            else
+            else if (m_CargandoLanzamiento)
             {
-                m_SwipeEnProgreso = false;
+                CancelarCarga();
             }
         }
 
-        /// <summary>
-        /// Captura el inicio y finalización del gesto de swipe en pantalla libre (fuera de UI).
-        /// </summary>
-        private void ProcesarEntradaParaLanzamiento()
+        private void ProcesarCargaYLanzamiento()
         {
-            Vector2 posicionActual;
+            Vector2 posActual;
 
-            // 1. Inicio del gesto de swipe
-            if (ObtenerPulsacionInicial(out posicionActual))
+            if (ObtenerPulsacionInicial(out posActual))
             {
-                // Escudo UI: Si el toque inició sobre un botón, se cancela de inmediato
-                if (ControladorAR.TocoInterfazDeUsuario(posicionActual))
+                if (ControladorAR.TocoInterfazDeUsuario(posActual))
                 {
-                    m_SwipeEnProgreso = false;
+                    CancelarCarga();
                     return;
                 }
 
-                m_SwipeInicioPos = posicionActual;
-                m_SwipeInicioTiempo = Time.time;
-                m_SwipeEnProgreso = true;
+                if (vistaUI != null && vistaUI.PosicionEstaEnZonaDisparo(posActual))
+                {
+                    m_CargandoLanzamiento = true;
+                    m_TiempoPresionado = 0f;
+                    m_CargaFuerzaNormalizada = 0f;
+                    m_SwipeInicioPos = posActual;
+
+                    vistaUI.ActualizarVisualesCarga(0f);
+                }
+                else
+                {
+                    CancelarCarga();
+                }
                 return;
             }
 
-            // 2. Finalización del gesto (levantar el dedo o soltar botón del ratón)
-            if (m_SwipeEnProgreso && ObtenerPulsacionFinal(out posicionActual))
+            if (m_CargandoLanzamiento && ObtenerPulsacionMantenida(out posActual))
             {
-                m_SwipeEnProgreso = false;
+                m_TiempoPresionado += Time.deltaTime;
 
-                Vector2 deltaSwipe = posicionActual - m_SwipeInicioPos;
+                float carga = Mathf.Clamp01(m_TiempoPresionado / tiempoCargaCompleta);
+
+                if (m_TiempoPresionado > tiempoCargaCompleta)
+                {
+                    float pulso = 0.94f + 0.06f * Mathf.Sin((m_TiempoPresionado - tiempoCargaCompleta) * 14.0f);
+                    m_CargaFuerzaNormalizada = pulso;
+                }
+                else
+                {
+                    m_CargaFuerzaNormalizada = carga;
+                }
+
+                if (vistaUI != null)
+                {
+                    vistaUI.ActualizarVisualesCarga(m_CargaFuerzaNormalizada);
+                }
+                return;
+            }
+
+            if (m_CargandoLanzamiento && ObtenerPulsacionFinal(out posActual))
+            {
+                m_CargandoLanzamiento = false;
+
+                Vector2 deltaSwipe = posActual - m_SwipeInicioPos;
                 float distanciaSwipe = deltaSwipe.magnitude;
 
-                // Lanzamiento válido: swipe hacia arriba superando el umbral de distancia
-                if (distanciaSwipe >= distanciaMinimaSwipe && deltaSwipe.y > 0)
+                if (distanciaSwipe >= distanciaMinimaSwipe && deltaSwipe.y > 15f)
                 {
-                    float deltaTiempo = Mathf.Max(Time.time - m_SwipeInicioTiempo, 0.05f);
+                    float deltaTiempo = Mathf.Max(m_TiempoPresionado, 0.04f);
                     float velocidadPantalla = distanciaSwipe / deltaTiempo;
 
-                    EjecutarLanzamientoProyectil(deltaSwipe, velocidadPantalla);
+                    EjecutarLanzamientoProyectil(deltaSwipe, velocidadPantalla, m_CargaFuerzaNormalizada);
                 }
+
+                CancelarCarga();
             }
         }
 
-        /// <summary>
-        /// Convierte el vector del swipe 2D en una fuerza 3D combinada con la orientación de la cámara AR.
-        /// </summary>
-        private void EjecutarLanzamientoProyectil(Vector2 deltaSwipe, float velocidadPantalla)
+        private void EjecutarLanzamientoProyectil(Vector2 deltaSwipe, float velocidadPantalla, float cargaFuerza)
         {
             if (GameManager_Tumbalatas.Instance == null || arCamera == null) return;
 
             GameObject prefabProyectil = GameManager_Tumbalatas.Instance.ObtenerPrefabProyectilActual();
             if (prefabProyectil == null) return;
 
-            // Punto de spawn: ligeramente al frente y por debajo del visor de la cámara
-            Vector3 origen = arCamera.transform.position + (arCamera.transform.forward * 0.25f) - (arCamera.transform.up * 0.05f);
+            Vector3 origen = arCamera.transform.position + (arCamera.transform.forward * 0.28f) - (arCamera.transform.up * 0.08f);
 
-            // Vector de dirección 3D combinando orientación de la cámara con la dirección del swipe
-            float desvioX = (deltaSwipe.x / Screen.width) * 1.6f;
-            float inclinacionY = Mathf.Clamp((deltaSwipe.y / Screen.height) * 1.8f, 0.2f, 1.5f);
+            float desvioX = (deltaSwipe.x / Screen.width) * 1.5f;
+            float inclinacionY = Mathf.Clamp((deltaSwipe.y / Screen.height) * 1.7f, 0.18f, 1.4f);
 
-            Vector3 direccion = (arCamera.transform.forward * 1.2f + arCamera.transform.up * inclinacionY + arCamera.transform.right * desvioX).normalized;
+            Vector3 direccion = (arCamera.transform.forward * 1.25f + arCamera.transform.up * inclinacionY + arCamera.transform.right * desvioX).normalized;
 
-            // Cálculo de fuerza acotada entre límites de seguridad
-            float fuerza = Mathf.Clamp(velocidadPantalla * factorFuerzaLanzamiento, fuerzaMinima, fuerzaMaxima);
+            float fuerzaBase = Mathf.Lerp(fuerzaMinima, fuerzaMaxima, cargaFuerza);
+            float bonoVelocidad = Mathf.Clamp(velocidadPantalla * 0.0025f, 0f, 2.5f);
+            float fuerzaFinal = Mathf.Clamp(fuerzaBase + bonoVelocidad, fuerzaMinima, fuerzaMaxima + 2.0f);
 
-            // Instanciamos el proyectil
             GameObject proyectil = Instantiate(prefabProyectil, origen, Quaternion.identity);
             Rigidbody rb = proyectil.GetComponent<Rigidbody>();
 
             if (rb != null)
             {
-                // Regla de cátedra: Continuous Dynamic en proyectiles rápidos para evitar efecto túnel
                 rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
-                rb.linearVelocity = direccion * fuerza;
-                rb.angularVelocity = arCamera.transform.right * 12.0f; // Giro rotacional realista
+                rb.linearVelocity = direccion * fuerzaFinal;
+                rb.angularVelocity = arCamera.transform.right * (10.0f + (cargaFuerza * 12.0f));
             }
 
             GameManager_Tumbalatas.Instance.RegistrarDisparo(proyectil);
-
             Destroy(proyectil, tiempoVidaProyectil);
         }
 
-        // =========================================================================
-        // ENTRADA MULTIPLATAFORMA (TOUCHSCREEN + MOUSE / POINTER)
-        // =========================================================================
+        private void CancelarCarga()
+        {
+            m_CargandoLanzamiento = false;
+            m_CargaFuerzaNormalizada = 0f;
+            m_TiempoPresionado = 0f;
+
+            if (vistaUI != null)
+            {
+                vistaUI.CancelarVisualesCarga();
+            }
+        }
+
+        public void ActualizarVisibilidadUIDisparo(bool visible)
+        {
+            if (vistaUI != null)
+            {
+                vistaUI.ActualizarVisibilidad(visible);
+            }
+        }
+
+        public void ActualizarVisualTipoMunicion()
+        {
+            if (vistaUI != null)
+            {
+                TipoProyectil tipo = GameManager_Tumbalatas.Instance != null 
+                    ? GameManager_Tumbalatas.Instance.TipoActual 
+                    : TipoProyectil.Tenis;
+
+                vistaUI.ActualizarVisualTipoMunicion(tipo);
+            }
+        }
 
         private bool ObtenerPulsacionInicial(out Vector2 posicion)
         {
             posicion = Vector2.zero;
 
-            // 1. Pantalla táctil en móvil Android
             if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.wasPressedThisFrame)
             {
                 posicion = Touchscreen.current.primaryTouch.position.ReadValue();
                 return true;
             }
 
-            // 2. Mouse en Editor / XR Simulator
             if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
             {
                 posicion = Mouse.current.position.ReadValue();
                 return true;
             }
 
-            // 3. Fallback genérico Pointer
             if (Pointer.current != null && Pointer.current.press.wasPressedThisFrame)
+            {
+                posicion = Pointer.current.position.ReadValue();
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ObtenerPulsacionMantenida(out Vector2 posicion)
+        {
+            posicion = Vector2.zero;
+
+            if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
+            {
+                posicion = Touchscreen.current.primaryTouch.position.ReadValue();
+                return true;
+            }
+
+            if (Mouse.current != null && Mouse.current.leftButton.isPressed)
+            {
+                posicion = Mouse.current.position.ReadValue();
+                return true;
+            }
+
+            if (Pointer.current != null && Pointer.current.press.isPressed)
             {
                 posicion = Pointer.current.position.ReadValue();
                 return true;
@@ -174,21 +262,18 @@ namespace TumbalatasAR
         {
             posicion = Vector2.zero;
 
-            // 1. Pantalla táctil en móvil Android
             if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.wasReleasedThisFrame)
             {
                 posicion = Touchscreen.current.primaryTouch.position.ReadValue();
                 return true;
             }
 
-            // 2. Mouse en Editor / XR Simulator
             if (Mouse.current != null && Mouse.current.leftButton.wasReleasedThisFrame)
             {
                 posicion = Mouse.current.position.ReadValue();
                 return true;
             }
 
-            // 3. Fallback genérico Pointer
             if (Pointer.current != null && Pointer.current.press.wasReleasedThisFrame)
             {
                 posicion = Pointer.current.position.ReadValue();

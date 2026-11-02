@@ -18,13 +18,6 @@ namespace TumbalatasAR
         Jugando
     }
 
-    /// <summary>
-    /// Controlador central de Realidad Aumentada (AR Foundation):
-    /// Gestiona World Tracking, detección y congelamiento de planos horizontales,
-    /// retícula de posicionamiento reactiva con feedback visual, colocación estática
-    /// con ARAnchor y recálculo limpio de superficies reales.
-    /// Segmentado según SRP: la balística de disparo se delega a LanzadorProyectiles.
-    /// </summary>
     public class ControladorAR : MonoBehaviour
     {
         public static ControladorAR Instance { get; private set; }
@@ -37,22 +30,26 @@ namespace TumbalatasAR
         [SerializeField] private Camera arCamera;
 
         [Header("Prefabs de Escena")]
-        [Tooltip("Indicador visual (retícula) proyectado sobre la superficie detectada")]
         [SerializeField] private GameObject reticlePrefab;
-
-        [Tooltip("Prefab principal de la estructura (Pedestal + Pirámide de Latas)")]
         [SerializeField] private GameObject estructuraPrefab;
 
         [Header("Subsistema de Lanzamiento")]
         [SerializeField] private LanzadorProyectiles lanzadorProyectiles;
 
+        [Header("Filtro Anti-Subzonas Coplanares")]
+        [SerializeField] private float umbralAlturaCoplanar = 0.04f;
+        [SerializeField] private float intervaloFiltradoPlanos = 0.2f;
+
         [Header("Estado Actual")]
         [SerializeField] private EstadoJuego estadoActual = EstadoJuego.Escaneando;
 
-        // Estructuras cacheadas para erradicar recolección de basura (GC) en cada frame
         private static readonly List<ARRaycastHit> s_Hits = new List<ARRaycastHit>();
         private static readonly List<RaycastResult> s_UIHits = new List<RaycastResult>();
         private static PointerEventData s_PointerEventData;
+
+        private readonly List<ARPlane> m_PlanosActivosCache = new List<ARPlane>();
+        private readonly HashSet<TrackableId> m_SubzonasOcultas = new HashSet<TrackableId>();
+        private float m_TiempoSiguienteFiltrado;
 
         private GameObject m_ReticleInstancia;
         private Vector3 m_EscalaBaseReticula = new Vector3(0.35f, 0.008f, 0.35f);
@@ -61,8 +58,24 @@ namespace TumbalatasAR
 
         public EstadoJuego EstadoActual => estadoActual;
         public bool HaySuperficieBajoMira => m_ReticleInstancia != null && m_ReticleInstancia.activeSelf;
-        public int CantidadPlanosDetectados => arPlaneManager != null ? arPlaneManager.trackables.count : 0;
+        public int CantidadPlanosDetectados
+        {
+            get
+            {
+                if (arPlaneManager == null) return 0;
+                int conteo = 0;
+                foreach (var plano in arPlaneManager.trackables)
+                {
+                    if (plano != null && plano.subsumedBy == null && plano.alignment == PlaneAlignment.HorizontalUp && !m_SubzonasOcultas.Contains(plano.trackableId))
+                    {
+                        conteo++;
+                    }
+                }
+                return conteo;
+            }
+        }
         public GameObject EstructuraInstanciada => m_EstructuraInstanciada;
+        public LanzadorProyectiles Lanzador => lanzadorProyectiles;
 
         private void Awake()
         {
@@ -91,6 +104,11 @@ namespace TumbalatasAR
                 arPlaneManager = FindFirstObjectByType<ARPlaneManager>();
             }
 
+            if (arPlaneManager != null)
+            {
+                arPlaneManager.requestedDetectionMode = PlaneDetectionMode.Horizontal;
+            }
+
             if (arAnchorManager == null)
             {
                 arAnchorManager = FindFirstObjectByType<ARAnchorManager>();
@@ -110,12 +128,6 @@ namespace TumbalatasAR
                 }
             }
 
-            // =========================================================================
-            // CALIBRACIÓN CRÍTICA DE ORIGEN Y CÁMARA (RESOLUCIÓN DE OFFSET INVERSO)
-            // =========================================================================
-            // En AR Móvil (ARCore/ARKit) y simulador XR, el modo Device con altura de ojo
-            // posiciona la cámara a 1.35m del piso virtual, garantizando que mesas (Y ~ 0.46m)
-            // y suelo (Y ~ 0m) se detecten SIEMPRE por debajo del visor y nunca por encima.
             XROrigin origin = FindFirstObjectByType<XROrigin>();
             if (origin != null)
             {
@@ -130,9 +142,7 @@ namespace TumbalatasAR
                 }
             }
 
-            // Aseguramos enlaces nativos de HandheldARInputDevice en TrackedPoseDriver si estuviesen ausentes
             ConfigurarTrackedPoseDriver();
-
             InicializarReticula();
         }
 
@@ -166,11 +176,10 @@ namespace TumbalatasAR
             }
             else
             {
-                // Respaldo dinámico: disco cilíndrico visible en caso de pérdida de referencia en inspector
                 m_ReticleInstancia = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
                 m_ReticleInstancia.transform.localScale = m_EscalaBaseReticula;
                 Collider col = m_ReticleInstancia.GetComponent<Collider>();
-                if (col != null) Destroy(col); // No debe interferir con físicas
+                if (col != null) Destroy(col);
             }
 
             m_ReticleInstancia.name = "Instancia_Reticula_AR";
@@ -192,32 +201,28 @@ namespace TumbalatasAR
             {
                 ActualizarReticulaPosicionamiento();
                 ProcesarEntradaParaColocacion();
+
+                m_TiempoSiguienteFiltrado -= Time.deltaTime;
+                if (m_TiempoSiguienteFiltrado <= 0f)
+                {
+                    m_TiempoSiguienteFiltrado = intervaloFiltradoPlanos;
+                    FiltrarSubZonasCoplanares();
+                }
             }
         }
 
-        // =========================================================================
-        // 1. ESCUDO UI (PROTECCIÓN DE CLICK-THROUGH)
-        // =========================================================================
-
-        /// <summary>
-        /// Comprueba si una coordenada de pantalla colisiona con un elemento interactivo de UI.
-        /// Método estático reutilizable por subsistemas auxiliares (LanzadorProyectiles, etc.).
-        /// </summary>
         public static bool TocoInterfazDeUsuario(Vector2 screenPosition)
         {
             if (EventSystem.current == null) return false;
 
-            // 1. Evaluación nativa táctil (primary touch en Android)
             if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
             {
                 int touchId = Touchscreen.current.primaryTouch.touchId.ReadValue();
                 if (EventSystem.current.IsPointerOverGameObject(touchId)) return true;
             }
 
-            // 2. Evaluación mouse / pointer en Unity Editor y simulador
             if (EventSystem.current.IsPointerOverGameObject()) return true;
 
-            // 3. Respaldo defensivo mediante RaycastAll sobre Canvas (Capa 5 = UI)
             if (s_PointerEventData == null)
             {
                 s_PointerEventData = new PointerEventData(EventSystem.current);
@@ -238,15 +243,6 @@ namespace TumbalatasAR
             return false;
         }
 
-        // =========================================================================
-        // 2. DETECCIÓN DE PLANOS REALES Y RETÍCULA REACTIVA
-        // =========================================================================
-
-        /// <summary>
-        /// Evalúa un punto en pantalla contra planos horizontales detectados por AR Foundation.
-        /// Cumple estrictamente con la regla de Cátedra: ARRaycastManager es la autoridad exclusiva
-        /// para mapeo del suelo real, previniendo colisiones erróneas con capas de entorno o simulación.
-        /// </summary>
         public bool ProbarSuperficieHorizontal(Vector2 puntoPantalla, out Vector3 posicion, out Quaternion rotacion, out ARPlane planoDetectado)
         {
             posicion = Vector3.zero;
@@ -255,27 +251,49 @@ namespace TumbalatasAR
 
             if (arCamera == null) return false;
 
-            // Escudo UI: descarta inmediatamente toques sobre botones
             if (TocoInterfazDeUsuario(puntoPantalla)) return false;
 
-            // 1. Detección oficial de AR Foundation (Planos dentro del polígono o sus límites)
             TrackableType tipoPlanos = TrackableType.PlaneWithinPolygon | TrackableType.PlaneWithinBounds;
             if (arRaycastManager != null && arRaycastManager.Raycast(puntoPantalla, s_Hits, tipoPlanos) && s_Hits.Count > 0)
             {
-                posicion = s_Hits[0].pose.position;
-                rotacion = s_Hits[0].pose.rotation;
-                planoDetectado = arPlaneManager != null ? arPlaneManager.GetPlane(s_Hits[0].trackableId) : null;
-                return true;
+                int mejorHit = -1;
+                float mayorArea = -1f;
+
+                for (int i = 0; i < s_Hits.Count; i++)
+                {
+                    ARPlane plano = arPlaneManager != null ? arPlaneManager.GetPlane(s_Hits[i].trackableId) : null;
+                    if (plano == null || plano.subsumedBy != null) continue;
+                    if (plano.alignment != PlaneAlignment.HorizontalUp) continue;
+
+                    Vector3 normalHit = s_Hits[i].pose.rotation * Vector3.up;
+                    if (Vector3.Dot(normalHit, Vector3.up) < 0.95f) continue;
+
+                    bool esSubzona = m_SubzonasOcultas.Contains(s_Hits[i].trackableId);
+                    float area = plano.size.x * plano.size.y;
+
+                    if (!esSubzona && area > mayorArea)
+                    {
+                        mayorArea = area;
+                        mejorHit = i;
+                    }
+                }
+
+                if (mejorHit >= 0)
+                {
+                    posicion = s_Hits[mejorHit].pose.position;
+                    rotacion = s_Hits[mejorHit].pose.rotation;
+                    planoDetectado = arPlaneManager != null ? arPlaneManager.GetPlane(s_Hits[mejorHit].trackableId) : null;
+                    return true;
+                }
             }
 
-            // 2. Respaldo defensivo exclusivo de Editor si aún no se generaron mallas AR
             if (Application.isEditor)
             {
                 int mascaraCapas = ~((1 << 5) | (1 << 7));
                 Ray rayo = arCamera.ScreenPointToRay(puntoPantalla);
                 if (Physics.Raycast(rayo, out RaycastHit hitFisico, 20f, mascaraCapas))
                 {
-                    if (hitFisico.normal.y > 0.65f)
+                    if (Vector3.Dot(hitFisico.normal, Vector3.up) >= 0.96f)
                     {
                         posicion = hitFisico.point;
                         rotacion = Quaternion.FromToRotation(Vector3.up, hitFisico.normal);
@@ -295,7 +313,6 @@ namespace TumbalatasAR
             Quaternion rot;
             ARPlane plano;
 
-            // A. Editor / Simulador: Seguir el puntero del ratón si está dentro del visor del Game
             if (Application.isEditor && Mouse.current != null)
             {
                 Vector2 posMouse = Mouse.current.position.ReadValue();
@@ -309,7 +326,6 @@ namespace TumbalatasAR
                 }
             }
 
-            // B. Centro de pantalla: Estándar para móviles Android
             Vector2 centroPantalla = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
             if (ProbarSuperficieHorizontal(centroPantalla, out pos, out rot, out plano))
             {
@@ -317,7 +333,6 @@ namespace TumbalatasAR
                 return;
             }
 
-            // C. Si no hay superficie bajo la mira, ocultar retícula
             if (m_ReticleInstancia.activeSelf)
             {
                 m_ReticleInstancia.SetActive(false);
@@ -328,13 +343,11 @@ namespace TumbalatasAR
         {
             m_PlanoSeleccionado = plano;
 
-            // Elevamos 5 mm por encima de la superficie para erradicar Z-fighting con el piso
             Vector3 normalSuperficie = rot * Vector3.up;
             Vector3 posicionElevada = pos + (normalSuperficie * 0.005f);
 
             m_ReticleInstancia.transform.SetPositionAndRotation(posicionElevada, rot);
 
-            // Feedback visual reactivo: suave pulsación de escala para indicar escaneo activo y receptivo
             float escalaPulsacion = 1f + (Mathf.Sin(Time.time * 5.0f) * 0.04f);
             m_ReticleInstancia.transform.localScale = m_EscalaBaseReticula * escalaPulsacion;
 
@@ -344,16 +357,92 @@ namespace TumbalatasAR
             }
         }
 
-        // =========================================================================
-        // 3. COLOCACIÓN DE ESTRUCTURA Y ANCLAJE ESPACIAL
-        // =========================================================================
+        private void FiltrarSubZonasCoplanares()
+        {
+            if (arPlaneManager == null) return;
+
+            m_PlanosActivosCache.Clear();
+
+            foreach (var plano in arPlaneManager.trackables)
+            {
+                if (plano != null && plano.subsumedBy == null && plano.trackingState != TrackingState.None)
+                {
+                    if (plano.alignment != PlaneAlignment.HorizontalUp)
+                    {
+                        SilenciarPlanoVisual(plano, true);
+                        continue;
+                    }
+
+                    m_PlanosActivosCache.Add(plano);
+                }
+            }
+
+            if (m_PlanosActivosCache.Count <= 1) return;
+
+            for (int i = 0; i < m_PlanosActivosCache.Count; i++)
+            {
+                var planoB = m_PlanosActivosCache[i];
+                if (planoB == null) continue;
+
+                bool esSubzona = false;
+
+                for (int j = 0; j < m_PlanosActivosCache.Count; j++)
+                {
+                    if (i == j) continue;
+                    var planoA = m_PlanosActivosCache[j];
+                    if (planoA == null) continue;
+
+                    float deltaY = Mathf.Abs(planoA.center.y - planoB.center.y);
+                    if (deltaY > umbralAlturaCoplanar) continue;
+
+                    float areaA = planoA.size.x * planoA.size.y;
+                    float areaB = planoB.size.x * planoB.size.y;
+                    if (areaA <= areaB) continue;
+
+                    Vector2 posA = new Vector2(planoA.center.x, planoA.center.z);
+                    Vector2 posB = new Vector2(planoB.center.x, planoB.center.z);
+                    float dist2D = Vector2.Distance(posA, posB);
+
+                    float radioA = Mathf.Max(planoA.size.x, planoA.size.y) * 0.65f;
+                    if (dist2D < radioA)
+                    {
+                        esSubzona = true;
+                        break;
+                    }
+                }
+
+                if (esSubzona)
+                {
+                    SilenciarPlanoVisual(planoB, true);
+                    m_SubzonasOcultas.Add(planoB.trackableId);
+                }
+                else if (m_SubzonasOcultas.Contains(planoB.trackableId))
+                {
+                    SilenciarPlanoVisual(planoB, false);
+                    m_SubzonasOcultas.Remove(planoB.trackableId);
+                }
+            }
+        }
+
+        private void SilenciarPlanoVisual(ARPlane plano, bool silenciar)
+        {
+            if (plano == null) return;
+
+            var visualizador = plano.GetComponent<ARPlaneMeshVisualizer>();
+            if (visualizador != null) visualizador.enabled = !silenciar;
+
+            var lineRenderer = plano.GetComponent<LineRenderer>();
+            if (lineRenderer != null) lineRenderer.enabled = !silenciar;
+
+            var meshRenderer = plano.GetComponent<MeshRenderer>();
+            if (meshRenderer != null) meshRenderer.enabled = !silenciar;
+        }
 
         private void ProcesarEntradaParaColocacion()
         {
             Vector2 posicionToque;
             if (!ObtenerPulsacionInicial(out posicionToque)) return;
 
-            // Escudo UI
             if (TocoInterfazDeUsuario(posicionToque)) return;
 
             if (estructuraPrefab == null) return;
@@ -361,14 +450,12 @@ namespace TumbalatasAR
             Vector3 posicionColocacion = Vector3.zero;
             bool posicionValida = false;
 
-            // 1. Prioridad: toque exacto sobre plano horizontal válido
             if (ProbarSuperficieHorizontal(posicionToque, out Vector3 posToque, out _, out ARPlane planoToque))
             {
                 posicionColocacion = posToque;
                 m_PlanoSeleccionado = planoToque;
                 posicionValida = true;
             }
-            // 2. Si se tocó pantalla libre para confirmar y la retícula ya estaba activa
             else if (m_ReticleInstancia != null && m_ReticleInstancia.activeSelf)
             {
                 Vector3 normal = m_ReticleInstancia.transform.up;
@@ -378,28 +465,22 @@ namespace TumbalatasAR
 
             if (posicionValida)
             {
-                // Orientamos la estructura hacia la cámara en el plano horizontal
                 Vector3 haciaCamara = arCamera.transform.position - posicionColocacion;
                 haciaCamara.y = 0;
                 Quaternion rotacion = haciaCamara.sqrMagnitude > 0.001f ? Quaternion.LookRotation(haciaCamara) : Quaternion.identity;
 
                 m_EstructuraInstanciada = Instantiate(estructuraPrefab, posicionColocacion, rotacion);
-
-                // Regla Cátedra (Advertencia 1): Anclaje exclusivo para bases estáticas (Pedestal)
                 m_EstructuraInstanciada.AddComponent<ARAnchor>();
 
-                // Ocultamos la retícula al colocar el juego
                 if (m_ReticleInstancia != null)
                 {
                     m_ReticleInstancia.SetActive(false);
                 }
 
-                // Regla Cátedra (Advertencia 2): Congelar detección para estabilizar físicas
                 CongelarPlanos();
 
                 estadoActual = EstadoJuego.Jugando;
 
-                // Notificamos al GameManager para habilitar la interfaz de juego y registrar latas
                 if (GameManager_Tumbalatas.Instance != null)
                 {
                     GameManager_Tumbalatas.Instance.RegistrarEstructuraInstanciada(m_EstructuraInstanciada);
@@ -407,13 +488,6 @@ namespace TumbalatasAR
             }
         }
 
-        // =========================================================================
-        // 4. CONGELAMIENTO, REUBICACIÓN Y RECÁLCULO LIMPIO DE PLANOS
-        // =========================================================================
-
-        /// <summary>
-        /// Congela la actualización de la malla física de ARPlaneManager para evitar jitter en Rigidbodies.
-        /// </summary>
         public void CongelarPlanos()
         {
             if (arPlaneManager == null) return;
@@ -432,11 +506,10 @@ namespace TumbalatasAR
             }
         }
 
-        /// <summary>
-        /// Descongela los planos y elimina la estructura previa para buscar una nueva ubicación.
-        /// </summary>
         public void DescongelarYReubicar()
         {
+            m_SubzonasOcultas.Clear();
+
             if (m_EstructuraInstanciada != null)
             {
                 Destroy(m_EstructuraInstanciada);
@@ -445,10 +518,12 @@ namespace TumbalatasAR
 
             if (arPlaneManager != null)
             {
+                arPlaneManager.requestedDetectionMode = PlaneDetectionMode.Horizontal;
                 arPlaneManager.enabled = true;
                 foreach (var plano in arPlaneManager.trackables)
                 {
                     if (plano == null) continue;
+                    if (plano.alignment != PlaneAlignment.HorizontalUp) continue;
 
                     var visualizador = plano.GetComponent<ARPlaneMeshVisualizer>();
                     if (visualizador != null) visualizador.enabled = true;
@@ -461,26 +536,21 @@ namespace TumbalatasAR
             estadoActual = EstadoJuego.Escaneando;
         }
 
-        /// <summary>
-        /// Recalcula por completo los planos borrando toda la información previa.
-        /// Elimina los GameObjects de planos generados y reinicia la sesión espacial de ARCore/ARSession.
-        /// </summary>
         public void RecalcularPlanos()
         {
-            // 1. Destruir estructura si existiera
+            m_SubzonasOcultas.Clear();
+
             if (m_EstructuraInstanciada != null)
             {
                 Destroy(m_EstructuraInstanciada);
                 m_EstructuraInstanciada = null;
             }
 
-            // 2. Ocultar retícula temporalmente
             if (m_ReticleInstancia != null)
             {
                 m_ReticleInstancia.SetActive(false);
             }
 
-            // 3. Eliminar objetos visuales de planos existentes
             if (arPlaneManager != null)
             {
                 arPlaneManager.enabled = false;
@@ -491,22 +561,17 @@ namespace TumbalatasAR
                         Destroy(plano.gameObject);
                     }
                 }
+                arPlaneManager.requestedDetectionMode = PlaneDetectionMode.Horizontal;
                 arPlaneManager.enabled = true;
             }
 
-            // 4. Reiniciar sesión AR Foundation para limpiar el mapa espacial interno
             if (arSession != null)
             {
                 arSession.Reset();
             }
 
-            // 5. Retornar al estado de escaneo
             estadoActual = EstadoJuego.Escaneando;
         }
-
-        // =========================================================================
-        // 5. ENTRADA DE USUARIO
-        // =========================================================================
 
         private bool ObtenerPulsacionInicial(out Vector2 posicion)
         {

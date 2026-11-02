@@ -14,12 +14,6 @@ namespace TumbalatasAR
         Acero
     }
 
-    /// <summary>
-    /// Administrador de la lógica de juego, marcador, munición y estados de la interfaz.
-    /// Controla la transición limpia entre el modo de escaneo y el modo de juego activo,
-    /// ocultando botones de tiro y reseteo hasta que el escenario esté posicionado.
-    /// Proporciona feedback dinámico durante la búsqueda de planos y permite su recálculo.
-    /// </summary>
     public class GameManager_Tumbalatas : MonoBehaviour
     {
         public static GameManager_Tumbalatas Instance { get; private set; }
@@ -28,10 +22,7 @@ namespace TumbalatasAR
         [SerializeField] private ControladorAR controladorAR;
 
         [Header("Prefabs de Proyectiles")]
-        [Tooltip("Prefab de pelota de tenis (liviana y elástica)")]
         [SerializeField] private GameObject prefabPelotaTenis;
-
-        [Tooltip("Prefab de bola de acero (pesada y contundente)")]
         [SerializeField] private GameObject prefabBolaAcero;
 
         [Header("Referencias de UI (UnityEngine.UI.Text)")]
@@ -50,10 +41,8 @@ namespace TumbalatasAR
         [SerializeField] private Button btnCambiarBola;
         [SerializeField] private Button btnResetear;
         [SerializeField] private Button btnReubicar;
-        [Tooltip("Botón visible en fase de escaneo para borrar planos y recalcular superficies")]
         [SerializeField] private Button btnRecalcularPlanos;
 
-        [Header("Contenedor de Proyectiles en Vuelo")]
         private readonly List<GameObject> m_ProyectilesActivos = new List<GameObject>();
 
         private TipoProyectil m_TipoActual = TipoProyectil.Tenis;
@@ -67,7 +56,6 @@ namespace TumbalatasAR
         private float m_TiempoUltimoReubicar;
         private float m_TiempoUltimoRecalcular;
 
-        // Caché de mensajes de escaneo para evitar asignación continua de strings en Update
         private int m_UltimoConteoPuntosAnim = -1;
         private bool m_UltimoEstadoSuperficie;
         private int m_UltimaCantidadPlanos = -1;
@@ -91,61 +79,21 @@ namespace TumbalatasAR
                 controladorAR = FindFirstObjectByType<ControladorAR>();
             }
 
-            // Input System UI Module
             var uiModule = FindFirstObjectByType<UnityEngine.InputSystem.UI.InputSystemUIInputModule>();
             if (uiModule != null)
             {
                 uiModule.AssignDefaultActions();
             }
 
-            // Búsqueda por jerarquía defensiva
             if (btnCambiarBola == null) btnCambiarBola = GameObject.Find("Btn_CambiarBola")?.GetComponent<Button>();
             if (btnResetear == null) btnResetear = GameObject.Find("Btn_Resetear")?.GetComponent<Button>();
             if (btnReubicar == null) btnReubicar = GameObject.Find("Btn_Reubicar")?.GetComponent<Button>();
             if (btnRecalcularPlanos == null) btnRecalcularPlanos = GameObject.Find("Btn_RecalcularPlanos")?.GetComponent<Button>();
 
-            // Respaldo dinámico: si no existe en la escena, creamos el botón a partir del estilo de Btn_Reubicar
-            if (btnRecalcularPlanos == null && btnReubicar != null)
-            {
-                CrearBotonRecalcularDinamico();
-            }
-
-            // Vinculación por PointerDown según regla de Cátedra
             RegistrarBoton(btnCambiarBola, AlternarMunicion);
             RegistrarBoton(btnResetear, ReiniciarPiramide);
             RegistrarBoton(btnReubicar, ReubicarEscenario);
             RegistrarBoton(btnRecalcularPlanos, RecalcularPlanos);
-        }
-
-        private void CrearBotonRecalcularDinamico()
-        {
-            GameObject nuevoBotonGO = Instantiate(btnReubicar.gameObject, btnReubicar.transform.parent);
-            nuevoBotonGO.name = "Btn_RecalcularPlanos";
-            btnRecalcularPlanos = nuevoBotonGO.GetComponent<Button>();
-
-            RectTransform rt = nuevoBotonGO.GetComponent<RectTransform>();
-            if (rt != null)
-            {
-                // Centrado en el panel inferior
-                rt.anchorMin = new Vector2(0.20f, 0.15f);
-                rt.anchorMax = new Vector2(0.80f, 0.85f);
-                rt.anchoredPosition = Vector2.zero;
-                rt.sizeDelta = Vector2.zero;
-            }
-
-            // Cambiamos color para distinguirlo (ámbar/dorado cálido)
-            Image img = nuevoBotonGO.GetComponent<Image>();
-            if (img != null)
-            {
-                img.color = new Color(0.92f, 0.58f, 0.15f, 1.0f);
-            }
-
-            // Etiqueta del botón
-            Text lbl = nuevoBotonGO.GetComponentInChildren<Text>();
-            if (lbl != null) lbl.text = "🔄 Recalcular Planos";
-
-            TMP_Text lblTMP = nuevoBotonGO.GetComponentInChildren<TMP_Text>();
-            if (lblTMP != null) lblTMP.text = "🔄 Recalcular Planos";
         }
 
         private void RegistrarBoton(Button btn, UnityEngine.Events.UnityAction accion)
@@ -176,21 +124,18 @@ namespace TumbalatasAR
             ActualizarUIPuntaje();
             ActualizarUITiros();
 
-            // Al inicio, aseguramos que solo se muestre el botón de recalcular y se oculten los de juego
             ActualizarVisibilidadBotones(EstadoJuego.Escaneando);
-            MostrarInstruccion("🔍 Escaneando entorno... Mueve la cámara lentamente hacia una mesa o el suelo.");
+            MostrarInstruccion("Buscando una superficie plana... Apuntá hacia una mesa o al piso.");
         }
 
         private void Update()
         {
             if (controladorAR == null) return;
 
-            // FASE 1: ESCANEANDO - Feedback visual dinámico del progreso de detección
             if (controladorAR.EstadoActual == EstadoJuego.Escaneando)
             {
                 ActualizarFeedbackEscaneo();
             }
-            // FASE 2: JUGANDO - Supervisión de latas derribadas y proyectiles
             else if (controladorAR.EstadoActual == EstadoJuego.Jugando)
             {
                 ActualizarProgresoJuego();
@@ -207,7 +152,7 @@ namespace TumbalatasAR
                 if (!m_UltimoEstadoSuperficie)
                 {
                     m_UltimoEstadoSuperficie = true;
-                    MostrarInstruccion("🎯 ¡Superficie detectada! Toca la pantalla para colocar el juego.");
+                    MostrarInstruccion("¡Superficie encontrada! Tocá la pantalla para ubicar las latas.");
                 }
             }
             else
@@ -219,19 +164,18 @@ namespace TumbalatasAR
                     if (m_UltimaCantidadPlanos != cantidadPlanos)
                     {
                         m_UltimaCantidadPlanos = cantidadPlanos;
-                        MostrarInstruccion($"🔍 Superficies detectadas ({cantidadPlanos}). Apunta la retícula a una mesa o piso.");
+                        MostrarInstruccion($"Superficies detectadas ({cantidadPlanos}). Apuntá al piso o a una mesa.");
                     }
                 }
                 else
                 {
                     m_UltimaCantidadPlanos = 0;
-                    // Animación suave de puntos sin asignación excesiva (3 fases)
                     int puntos = ((int)(Time.time * 2.5f) % 3) + 1;
                     if (puntos != m_UltimoConteoPuntosAnim)
                     {
                         m_UltimoConteoPuntosAnim = puntos;
                         string sufijo = puntos == 1 ? "." : (puntos == 2 ? ".." : "...");
-                        MostrarInstruccion($"🔍 Buscando superficies planas{sufijo} Mueve el celular apuntando al suelo o mesa.");
+                        MostrarInstruccion($"Buscando superficies{sufijo} Mové el celular apuntando a una mesa o al piso.");
                     }
                 }
             }
@@ -257,15 +201,11 @@ namespace TumbalatasAR
 
                 if (m_LatasDerribadas >= m_TotalLatas)
                 {
-                    MostrarInstruccion("🏆 ¡Excelente! ¡Derribaste todas las latas! Pulsa 'Resetear' para jugar otra vez.");
+                    MostrarInstruccion("¡Tiraste todas las latas! Tocá 'Reiniciar' para jugar de nuevo.");
                 }
             }
         }
 
-        /// <summary>
-        /// Controla la visibilidad de los botones según el estado actual del juego.
-        /// Durante el escaneo se ocultan Resetear y Cambiar Bola, y se exhibe Recalcular Planos.
-        /// </summary>
         public void ActualizarVisibilidadBotones(EstadoJuego estado)
         {
             bool jugando = (estado == EstadoJuego.Jugando);
@@ -275,12 +215,13 @@ namespace TumbalatasAR
             if (btnReubicar != null) btnReubicar.gameObject.SetActive(jugando);
 
             if (btnRecalcularPlanos != null) btnRecalcularPlanos.gameObject.SetActive(!jugando);
+
+            if (LanzadorProyectiles.Instance != null)
+            {
+                LanzadorProyectiles.Instance.ActualizarVisibilidadUIDisparo(jugando);
+            }
         }
 
-        /// <summary>
-        /// Se invoca al instanciarse la pirámide en el mundo real.
-        /// Activa la interfaz de juego y los botones de reseteo y munición.
-        /// </summary>
         public void RegistrarEstructuraInstanciada(GameObject estructura)
         {
             m_LatasEnEscena = estructura.GetComponentsInChildren<LataIndividual>();
@@ -292,20 +233,14 @@ namespace TumbalatasAR
             ActualizarUITiros();
             ActualizarVisibilidadBotones(EstadoJuego.Jugando);
 
-            MostrarInstruccion("¡Puesto de tiro listo! Desliza el dedo (swipe) hacia las latas para disparar la bola.");
+            MostrarInstruccion("¡Listo para jugar! Mantené el círculo para cargar fuerza y deslizá hacia arriba para tirar.");
         }
 
-        /// <summary>
-        /// Retorna el prefab del proyectil seleccionado.
-        /// </summary>
         public GameObject ObtenerPrefabProyectilActual()
         {
             return m_TipoActual == TipoProyectil.Tenis ? prefabPelotaTenis : prefabBolaAcero;
         }
 
-        /// <summary>
-        /// Registra un proyectil disparado.
-        /// </summary>
         public void RegistrarDisparo(GameObject proyectil)
         {
             m_TirosRealizados++;
@@ -317,9 +252,6 @@ namespace TumbalatasAR
             }
         }
 
-        /// <summary>
-        /// Alterna entre Pelota de Tenis y Bola de Acero.
-        /// </summary>
         public void AlternarMunicion()
         {
             if (Time.unscaledTime - m_TiempoUltimoCambioBola < 0.25f) return;
@@ -327,17 +259,18 @@ namespace TumbalatasAR
 
             m_TipoActual = (m_TipoActual == TipoProyectil.Tenis) ? TipoProyectil.Acero : TipoProyectil.Tenis;
             ActualizarUIMunicion();
+
+            if (LanzadorProyectiles.Instance != null)
+            {
+                LanzadorProyectiles.Instance.ActualizarVisualTipoMunicion();
+            }
         }
 
-        /// <summary>
-        /// Restablece todas las latas a su posición inicial sobre el pedestal y destruye proyectiles.
-        /// </summary>
         public void ReiniciarPiramide()
         {
             if (Time.unscaledTime - m_TiempoUltimoReset < 0.25f) return;
             m_TiempoUltimoReset = Time.unscaledTime;
 
-            // 1. Limpieza de proyectiles en vuelo
             for (int i = m_ProyectilesActivos.Count - 1; i >= 0; i--)
             {
                 if (m_ProyectilesActivos[i] != null)
@@ -347,7 +280,6 @@ namespace TumbalatasAR
             }
             m_ProyectilesActivos.Clear();
 
-            // 2. Restablecer latas sin GC
             if (m_LatasEnEscena != null)
             {
                 for (int i = 0; i < m_LatasEnEscena.Length; i++)
@@ -363,12 +295,9 @@ namespace TumbalatasAR
             m_TirosRealizados = 0;
             ActualizarUIPuntaje();
             ActualizarUITiros();
-            MostrarInstruccion("¡Latas restablecidas! Desliza el dedo hacia las latas para disparar.");
+            MostrarInstruccion("¡Latas listas! Mantené el círculo para cargar fuerza y deslizá hacia arriba para tirar.");
         }
 
-        /// <summary>
-        /// Vuelve al modo de escaneo para situar el juego en otra parte.
-        /// </summary>
         public void ReubicarEscenario()
         {
             if (Time.unscaledTime - m_TiempoUltimoReubicar < 0.25f) return;
@@ -384,13 +313,9 @@ namespace TumbalatasAR
             ActualizarVisibilidadBotones(EstadoJuego.Escaneando);
             m_UltimoEstadoSuperficie = false;
             m_UltimaCantidadPlanos = -1;
-            MostrarInstruccion("🔍 Mueve la cámara para buscar una nueva superficie plana y toca para reubicar.");
+            MostrarInstruccion("Mové la cámara para buscar otra superficie y tocá la pantalla para ubicar las latas.");
         }
 
-        /// <summary>
-        /// Borra la información previa de planos y reinicia el escaneo desde cero.
-        /// Conectado al botón exclusivo de fase de escaneo (Btn_RecalcularPlanos).
-        /// </summary>
         public void RecalcularPlanos()
         {
             if (Time.unscaledTime - m_TiempoUltimoRecalcular < 0.25f) return;
@@ -406,7 +331,7 @@ namespace TumbalatasAR
             ActualizarVisibilidadBotones(EstadoJuego.Escaneando);
             m_UltimoEstadoSuperficie = false;
             m_UltimaCantidadPlanos = -1;
-            MostrarInstruccion("🔄 Planos anteriores eliminados. Reiniciando escaneo... Apunta la cámara a una mesa o piso.");
+            MostrarInstruccion("Planos reiniciados. Apuntá la cámara a una mesa o al piso.");
         }
 
         public void MostrarInstruccion(string mensaje)
@@ -431,8 +356,8 @@ namespace TumbalatasAR
 
         private void ActualizarUIMunicion()
         {
-            string nombre = (m_TipoActual == TipoProyectil.Tenis) ? "Tenis (Rebotante)" : "Acero (Pesada)";
-            string texto = $"Bola: {nombre}";
+            string nombre = (m_TipoActual == TipoProyectil.Tenis) ? "Tenis" : "Acero";
+            string texto = $"Pelota: {nombre}";
             if (txtMunicion != null) txtMunicion.text = texto;
             if (txtMunicionTMP != null) txtMunicionTMP.text = texto;
         }
